@@ -1,0 +1,31 @@
+name: iKuuu Checkin
+
+on:
+  schedule:
+    # UTC 00:30 = 北京时间 08:30
+    - cron: "30 0 * * *"
+  workflow_dispatch:
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run checkin
+        env:
+          IKUUU_COOKIE: ${{ secrets.IKUUU_COOKIE }}
+          IKUUU_NO_NOTIFY: "1"
+          PYTHONIOENCODING: utf-8
+        run: python ikuuu_checkin.py
