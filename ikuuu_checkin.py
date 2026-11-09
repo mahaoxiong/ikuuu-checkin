@@ -102,10 +102,33 @@ def log(msg=""):
 
 
 def split_multi(raw):
-    """把多行 / & / ; 分隔的配置拆成列表。"""
+    """按换行拆分配置项。
+
+    注意：cookie 字符串内部本身含分号（PHPSESSID=x; uid=y; key=z），
+    所以这里绝不能按 ';' 或 '&' 拆，否则一条 cookie 会被切碎。
+    """
     if not raw:
         return []
-    return [p.strip() for p in re.split(r"[\r\n&;]+", raw) if p.strip()]
+    return [p.strip() for p in re.split(r"[\r\n]+", raw) if p.strip()]
+
+
+def split_cookies(raw):
+    """按换行拆成多条 cookie；同一行里若粘了多个 PHPSESSID 也能切开。"""
+    entries = []
+    for line in split_multi(raw):
+        line = line.strip().strip("&;").strip()
+        if not line:
+            continue
+        starts = [m.start() for m in re.finditer(r"PHPSESSID=", line)]
+        if len(starts) > 1:
+            for i, s in enumerate(starts):
+                e = starts[i + 1] if i + 1 < len(starts) else len(line)
+                piece = line[s:e].strip().strip("&;").strip()
+                if piece:
+                    entries.append(piece)
+        else:
+            entries.append(line)
+    return entries
 
 
 def pick_ua():
@@ -134,6 +157,17 @@ def mask_email(email):
 def extract_phpsessid(cookie_str):
     m = re.search(r"PHPSESSID=([^;,\s]+)", cookie_str or "")
     return m.group(1) if m else None
+
+
+def cookie_expire_days(cookie_str):
+    """cookie 里的 expire_in 是过期时间戳，返回剩余天数；解析不出来返回 None。"""
+    m = re.search(r"expire_in=(\d+)", cookie_str or "")
+    if not m:
+        return None
+    ts = int(m.group(1))
+    if ts > 10**12:  # 毫秒
+        ts //= 1000
+    return (ts - time.time()) / 86400
 
 
 def apply_cookie(sess, domain, cookie_str):
@@ -234,10 +268,14 @@ def probe_domain(forced=None):
                 headers={"User-Agent": pick_ua()},
                 allow_redirects=True,
             )
-            if resp.status_code == 200 and len(resp.text) > 1000:
+            # 真站点登录页是 base64 混淆壳（含 originBody）；公告页 / 跳转页没有
+            if resp.status_code == 200 and "originBody" in (resp.text or ""):
                 log(f"[域名] 使用域名：{dom}")
                 return dom
-            log(f"[域名] {dom} 返回 {resp.status_code}，换下一个")
+            if resp.status_code == 200:
+                log(f"[域名] {dom} 是域名公告页而非站点，换下一个")
+            else:
+                log(f"[域名] {dom} 返回 {resp.status_code}，换下一个")
         except Exception as exc:
             log(f"[域名] {dom} 不可达（{type(exc).__name__}），换下一个")
     return None
@@ -251,7 +289,13 @@ def is_logged_in(sess, domain):
             timeout=cfg_float("IKUUU_TIMEOUT", 15),
             allow_redirects=True,
         )
-        return "/auth/login" not in resp.url and resp.status_code == 200
+        if resp.status_code != 200 or "/auth/login" in resp.url:
+            return False
+        # 有些域名只挂「最新域名」公告页，HTTP 200 但不是用户页，不能当登录成功
+        text = resp.text or ""
+        if "最新域名" in text and "originBody" not in text:
+            return False
+        return True
     except Exception:
         return False
 
@@ -467,7 +511,7 @@ def send_notify(title, content):
 def build_tasks():
     """cookie 优先；cookie 不够时用邮箱密码补位。"""
     accounts = load_accounts()
-    cookies = split_multi(env("IKUUU_COOKIE"))
+    cookies = split_cookies(env("IKUUU_COOKIE"))
 
     tasks = []
     seen = set()
@@ -481,6 +525,15 @@ def build_tasks():
         if key in seen:
             continue
         seen.add(key)
+        days = cookie_expire_days(raw)
+        if days is not None:
+            if days <= 0:
+                log(f"[配置] {key} 的 cookie 已过期（expire_in），请重新获取")
+            elif days <= 3:
+                log(f"[配置] {key} 的 cookie 还剩 {days:.1f} 天过期，建议提前更新")
+        if "uid=" not in raw:
+            log(f"[配置] {key} 只有 PHPSESSID，缺少 uid/key 等字段，多半会判失效——"
+                f"请复制浏览器里完整的 Cookie 整行")
         tasks.append({"email": key, "passwd": "", "cookie": raw})
 
     for email, passwd in accounts:
